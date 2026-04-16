@@ -86,7 +86,7 @@ func main() {
 
 	logGroups := []string(opts.logGroups)
 	if len(logGroups) == 0 {
-		logGroups, err = discoverLogGroups(ctx, client)
+		logGroups, err = discoverLogGroups(ctx, client, end)
 		if err != nil {
 			log.Fatalf("erro ao listar grupos de log: %v", err)
 		}
@@ -164,7 +164,7 @@ func parseDate(value string) (time.Time, error) {
 	return time.ParseInLocation(dateLayout, value, time.Local)
 }
 
-func discoverLogGroups(ctx context.Context, client *cloudwatchlogs.Client) ([]string, error) {
+func discoverLogGroups(ctx context.Context, client *cloudwatchlogs.Client, queryEnd time.Time) ([]string, error) {
 	var names []string
 	var nextToken *string
 
@@ -177,7 +177,7 @@ func discoverLogGroups(ctx context.Context, client *cloudwatchlogs.Client) ([]st
 		}
 
 		for _, group := range output.LogGroups {
-			if group.LogGroupName != nil {
+			if group.LogGroupName != nil && logGroupCanContainTime(group, queryEnd) {
 				names = append(names, *group.LogGroupName)
 			}
 		}
@@ -191,6 +191,24 @@ func discoverLogGroups(ctx context.Context, client *cloudwatchlogs.Client) ([]st
 	return names, nil
 }
 
+func logGroupCanContainTime(group types.LogGroup, queryEnd time.Time) bool {
+	if group.CreationTime != nil {
+		createdAt := time.UnixMilli(*group.CreationTime)
+		if queryEnd.Before(createdAt) {
+			return false
+		}
+	}
+
+	if group.RetentionInDays != nil {
+		retentionStart := time.Now().AddDate(0, 0, -int(*group.RetentionInDays))
+		if queryEnd.Before(retentionStart) {
+			return false
+		}
+	}
+
+	return true
+}
+
 func findExecutionARNs(ctx context.Context, client *cloudwatchlogs.Client, logGroups []string, logStream, msg string, start, end time.Time, timeout time.Duration) ([]string, error) {
 	query := fmt.Sprintf(`fields @timestamp, execution_arn, id
 | filter strcontains(@logStream, '%s')
@@ -200,7 +218,7 @@ func findExecutionARNs(ctx context.Context, client *cloudwatchlogs.Client, logGr
 
 	unique := make(map[string]struct{})
 	for _, groupChunk := range chunks(logGroups, maxLogGroups) {
-		results, err := runQuery(ctx, client, groupChunk, query, start, end, timeout)
+		results, err := runQueryForLogGroups(ctx, client, groupChunk, query, start, end, timeout)
 		if err != nil {
 			return nil, err
 		}
@@ -233,7 +251,7 @@ func findFirstSteps(ctx context.Context, client *cloudwatchlogs.Client, logGroup
 | display execution_arn, @timestamp`, escapeLogInsightsString(arn))
 
 		for _, groupChunk := range chunks(logGroups, maxLogGroups) {
-			rows, err := runQuery(ctx, client, groupChunk, query, start, end, timeout)
+			rows, err := runQueryForLogGroups(ctx, client, groupChunk, query, start, end, timeout)
 			if err != nil {
 				return nil, err
 			}
@@ -261,6 +279,35 @@ func findFirstSteps(ctx context.Context, client *cloudwatchlogs.Client, logGroup
 	}
 
 	return results, nil
+}
+
+func runQueryForLogGroups(ctx context.Context, client *cloudwatchlogs.Client, logGroups []string, query string, start, end time.Time, timeout time.Duration) ([][]types.ResultField, error) {
+	results, err := runQuery(ctx, client, logGroups, query, start, end, timeout)
+	if err == nil {
+		return results, nil
+	}
+
+	if !isTimeRangeLogGroupError(err) {
+		return nil, err
+	}
+
+	if len(logGroups) == 1 {
+		log.Printf("ignorando log group %q: janela de busca fora do periodo disponivel", logGroups[0])
+		return nil, nil
+	}
+
+	middle := len(logGroups) / 2
+	left, err := runQueryForLogGroups(ctx, client, logGroups[:middle], query, start, end, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	right, err := runQueryForLogGroups(ctx, client, logGroups[middle:], query, start, end, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	return append(left, right...), nil
 }
 
 func runQuery(ctx context.Context, client *cloudwatchlogs.Client, logGroups []string, query string, start, end time.Time, timeout time.Duration) ([][]types.ResultField, error) {
@@ -306,6 +353,13 @@ func runQuery(ctx context.Context, client *cloudwatchlogs.Client, logGroups []st
 			}
 		}
 	}
+}
+
+func isTimeRangeLogGroupError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "malformedqueryexception") &&
+		strings.Contains(message, "creation time") &&
+		strings.Contains(message, "retention")
 }
 
 func chunks(values []string, size int) [][]string {
