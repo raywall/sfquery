@@ -192,6 +192,10 @@ func discoverLogGroups(ctx context.Context, client *cloudwatchlogs.Client, query
 }
 
 func logGroupCanContainTime(group types.LogGroup, queryEnd time.Time) bool {
+	if group.LogGroupClass == types.LogGroupClassDelivery {
+		return false
+	}
+
 	if group.CreationTime != nil {
 		createdAt := time.UnixMilli(*group.CreationTime)
 		if queryEnd.Before(createdAt) {
@@ -287,13 +291,17 @@ func runQueryForLogGroups(ctx context.Context, client *cloudwatchlogs.Client, lo
 		return results, nil
 	}
 
-	if !isTimeRangeLogGroupError(err) {
+	if !isRetryableLogGroupScopeError(err) {
 		return nil, err
 	}
 
 	if len(logGroups) == 1 {
-		log.Printf("ignorando log group %q: janela de busca fora do periodo disponivel", logGroups[0])
-		return nil, nil
+		if isTimeRangeLogGroupError(err) || isUnsupportedLogClassError(err) {
+			log.Printf("ignorando log group %q: %v", logGroups[0], err)
+			return nil, nil
+		}
+
+		return nil, err
 	}
 
 	middle := len(logGroups) / 2
@@ -355,11 +363,27 @@ func runQuery(ctx context.Context, client *cloudwatchlogs.Client, logGroups []st
 	}
 }
 
+func isRetryableLogGroupScopeError(err error) bool {
+	return isTimeRangeLogGroupError(err) || isMixedLogClassError(err) || isUnsupportedLogClassError(err)
+}
+
 func isTimeRangeLogGroupError(err error) bool {
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "malformedqueryexception") &&
 		strings.Contains(message, "creation time") &&
 		strings.Contains(message, "retention")
+}
+
+func isMixedLogClassError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "invalidparameterexception") &&
+		strings.Contains(message, "same log class")
+}
+
+func isUnsupportedLogClassError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "log class") &&
+		(strings.Contains(message, "not supported") || strings.Contains(message, "unsupported"))
 }
 
 func chunks(values []string, size int) [][]string {
