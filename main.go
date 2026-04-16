@@ -533,11 +533,11 @@ func parseCloudWatchTimestamp(value string) (time.Time, error) {
 
 func buildStepFunctionsURL(region, arn string, timestamp time.Time) string {
 	return fmt.Sprintf(
-		"https://%s.console.aws.amazon.com/states/home?region=%s#/express-executions/details/%s?startDate=%s",
+		"https://%s.console.aws.amazon.com/states/home?region=%s#/express-executions/details/%s?startDate=%d",
 		region,
 		region,
 		arn,
-		timestamp.UTC().Format(time.RFC3339Nano),
+		timestamp.UnixMilli(),
 	)
 }
 
