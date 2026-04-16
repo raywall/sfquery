@@ -55,6 +55,11 @@ type stepResult struct {
 	Timestamp    time.Time
 }
 
+type logGroupBatch struct {
+	Class types.LogGroupClass
+	Names []string
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -84,19 +89,24 @@ func main() {
 
 	client := cloudwatchlogs.NewFromConfig(cfg)
 
-	logGroups := []string(opts.logGroups)
-	if len(logGroups) == 0 {
-		logGroups, err = discoverLogGroups(ctx, client, end)
+	var logGroupBatches []logGroupBatch
+	if len(opts.logGroups) == 0 {
+		logGroupBatches, err = discoverLogGroupBatches(ctx, client, end)
 		if err != nil {
 			log.Fatalf("erro ao listar grupos de log: %v", err)
 		}
+	} else {
+		logGroupBatches, err = describeSelectedLogGroupBatches(ctx, client, []string(opts.logGroups), end)
+		if err != nil {
+			log.Fatalf("erro ao consultar grupos de log informados: %v", err)
+		}
 	}
 
-	if len(logGroups) == 0 {
+	if len(logGroupBatches) == 0 {
 		log.Fatal("nenhum grupo de log encontrado na regiao informada")
 	}
 
-	arns, err := findExecutionARNs(ctx, client, logGroups, opts.logStream, opts.msg, start, end, opts.timeout)
+	arns, err := findExecutionARNs(ctx, client, logGroupBatches, opts.logStream, opts.msg, start, end, opts.timeout)
 	if err != nil {
 		log.Fatalf("erro ao buscar execution_arn: %v", err)
 	}
@@ -106,7 +116,7 @@ func main() {
 		return
 	}
 
-	results, err := findFirstSteps(ctx, client, logGroups, arns, start, end, opts.timeout)
+	results, err := findFirstSteps(ctx, client, logGroupBatches, arns, start, end, opts.timeout)
 	if err != nil {
 		log.Fatalf("erro ao buscar timestamp do primeiro step: %v", err)
 	}
@@ -164,13 +174,38 @@ func parseDate(value string) (time.Time, error) {
 	return time.ParseInLocation(dateLayout, value, time.Local)
 }
 
-func discoverLogGroups(ctx context.Context, client *cloudwatchlogs.Client, queryEnd time.Time) ([]string, error) {
+func discoverLogGroupBatches(ctx context.Context, client *cloudwatchlogs.Client, queryEnd time.Time) ([]logGroupBatch, error) {
+	classes := []types.LogGroupClass{
+		types.LogGroupClassStandard,
+		types.LogGroupClassInfrequentAccess,
+	}
+
+	var batches []logGroupBatch
+	for _, class := range classes {
+		names, err := discoverLogGroupsByClass(ctx, client, class, queryEnd)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, chunk := range chunks(names, maxLogGroups) {
+			batches = append(batches, logGroupBatch{
+				Class: class,
+				Names: chunk,
+			})
+		}
+	}
+
+	return batches, nil
+}
+
+func discoverLogGroupsByClass(ctx context.Context, client *cloudwatchlogs.Client, class types.LogGroupClass, queryEnd time.Time) ([]string, error) {
 	var names []string
 	var nextToken *string
 
 	for {
 		output, err := client.DescribeLogGroups(ctx, &cloudwatchlogs.DescribeLogGroupsInput{
-			NextToken: nextToken,
+			LogGroupClass: class,
+			NextToken:     nextToken,
 		})
 		if err != nil {
 			return nil, err
@@ -189,6 +224,71 @@ func discoverLogGroups(ctx context.Context, client *cloudwatchlogs.Client, query
 	}
 
 	return names, nil
+}
+
+func describeSelectedLogGroupBatches(ctx context.Context, client *cloudwatchlogs.Client, selected []string, queryEnd time.Time) ([]logGroupBatch, error) {
+	byClass := make(map[types.LogGroupClass][]string)
+	var fallback []logGroupBatch
+
+	for _, name := range selected {
+		group, found, err := describeExactLogGroup(ctx, client, name)
+		if err != nil {
+			return nil, err
+		}
+
+		if !found {
+			log.Printf("nao foi possivel descobrir a classe do log group %q; consultando isoladamente", name)
+			fallback = append(fallback, logGroupBatch{Names: []string{name}})
+			continue
+		}
+
+		if !logGroupCanContainTime(group, queryEnd) {
+			log.Printf("ignorando log group %q: janela de busca fora do periodo disponivel ou classe sem suporte", name)
+			continue
+		}
+
+		byClass[group.LogGroupClass] = append(byClass[group.LogGroupClass], name)
+	}
+
+	var batches []logGroupBatch
+	for class, names := range byClass {
+		for _, chunk := range chunks(names, maxLogGroups) {
+			batches = append(batches, logGroupBatch{
+				Class: class,
+				Names: chunk,
+			})
+		}
+	}
+	batches = append(batches, fallback...)
+
+	return batches, nil
+}
+
+func describeExactLogGroup(ctx context.Context, client *cloudwatchlogs.Client, name string) (types.LogGroup, bool, error) {
+	var nextToken *string
+
+	for {
+		output, err := client.DescribeLogGroups(ctx, &cloudwatchlogs.DescribeLogGroupsInput{
+			LogGroupNamePrefix: aws.String(name),
+			NextToken:          nextToken,
+		})
+		if err != nil {
+			return types.LogGroup{}, false, err
+		}
+
+		for _, group := range output.LogGroups {
+			if group.LogGroupName != nil && *group.LogGroupName == name {
+				return group, true, nil
+			}
+		}
+
+		if output.NextToken == nil {
+			break
+		}
+		nextToken = output.NextToken
+	}
+
+	return types.LogGroup{}, false, nil
 }
 
 func logGroupCanContainTime(group types.LogGroup, queryEnd time.Time) bool {
@@ -213,7 +313,7 @@ func logGroupCanContainTime(group types.LogGroup, queryEnd time.Time) bool {
 	return true
 }
 
-func findExecutionARNs(ctx context.Context, client *cloudwatchlogs.Client, logGroups []string, logStream, msg string, start, end time.Time, timeout time.Duration) ([]string, error) {
+func findExecutionARNs(ctx context.Context, client *cloudwatchlogs.Client, logGroupBatches []logGroupBatch, logStream, msg string, start, end time.Time, timeout time.Duration) ([]string, error) {
 	query := fmt.Sprintf(`fields @timestamp, execution_arn, id
 | filter strcontains(@logStream, '%s')
   and @message like /%s/
@@ -221,8 +321,8 @@ func findExecutionARNs(ctx context.Context, client *cloudwatchlogs.Client, logGr
 | sort @timestamp desc`, escapeLogInsightsString(logStream), escapeLogInsightsRegex(msg))
 
 	unique := make(map[string]struct{})
-	for _, groupChunk := range chunks(logGroups, maxLogGroups) {
-		results, err := runQueryForLogGroups(ctx, client, groupChunk, query, start, end, timeout)
+	for _, batch := range logGroupBatches {
+		results, err := runQueryForLogGroups(ctx, client, batch.Names, query, start, end, timeout)
 		if err != nil {
 			return nil, err
 		}
@@ -243,7 +343,7 @@ func findExecutionARNs(ctx context.Context, client *cloudwatchlogs.Client, logGr
 	return arns, nil
 }
 
-func findFirstSteps(ctx context.Context, client *cloudwatchlogs.Client, logGroups []string, arns []string, start, end time.Time, timeout time.Duration) ([]stepResult, error) {
+func findFirstSteps(ctx context.Context, client *cloudwatchlogs.Client, logGroupBatches []logGroupBatch, arns []string, start, end time.Time, timeout time.Duration) ([]stepResult, error) {
 	resultsByARN := make(map[string]stepResult)
 
 	for _, arn := range arns {
@@ -254,8 +354,8 @@ func findFirstSteps(ctx context.Context, client *cloudwatchlogs.Client, logGroup
 | limit 1
 | display execution_arn, @timestamp`, escapeLogInsightsString(arn))
 
-		for _, groupChunk := range chunks(logGroups, maxLogGroups) {
-			rows, err := runQueryForLogGroups(ctx, client, groupChunk, query, start, end, timeout)
+		for _, batch := range logGroupBatches {
+			rows, err := runQueryForLogGroups(ctx, client, batch.Names, query, start, end, timeout)
 			if err != nil {
 				return nil, err
 			}
@@ -296,7 +396,7 @@ func runQueryForLogGroups(ctx context.Context, client *cloudwatchlogs.Client, lo
 	}
 
 	if len(logGroups) == 1 {
-		if isTimeRangeLogGroupError(err) || isUnsupportedLogClassError(err) {
+		if isTimeRangeLogGroupError(err) || isMixedLogClassError(err) || isUnsupportedLogClassError(err) {
 			log.Printf("ignorando log group %q: %v", logGroups[0], err)
 			return nil, nil
 		}
